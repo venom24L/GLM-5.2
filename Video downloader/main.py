@@ -1,6 +1,12 @@
 """
-Video Downloader Backend
-FastAPI + yt-dlp + WebSocket for real-time progress
+Video Downloader Backend — Multi-layer fallback engine
+======================================================
+Layer 1: yt-dlp (works for 95% of sites)
+Layer 2: curl_cffi (Cloudflare TLS-fingerprint bypass)
+Layer 3: Playwright headless browser (JS challenge bypass)
+Layer 4: Direct MP4 download (for raw video URLs)
+
+Plus: WebSocket heartbeat to prevent UI from freezing at 0%
 """
 
 import os
@@ -10,7 +16,7 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import yt_dlp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request
@@ -18,15 +24,20 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-# Silent logger for yt-dlp noise
 logging.getLogger("yt_dlp").setLevel(logging.ERROR)
 
-# Optional: curl_cffi for Cloudflare TLS-fingerprint bypass
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CFFI = True
 except ImportError:
     HAS_CFFI = False
+
+try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 
 # ============================================================
 # Configuration
@@ -36,13 +47,12 @@ STATIC_DIR = BASE_DIR / "static"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-# File auto-cleanup time (seconds) - 2 hours
-FILE_LIFETIME = 2 * 60 * 60
+FILE_LIFETIME = 2 * 60 * 60  # 2 hours
 
 # ============================================================
-# App initialization
+# App
 # ============================================================
-app = FastAPI(title="Video Downloader API", version="1.0.0")
+app = FastAPI(title="Video Downloader API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,17 +68,16 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ============================================================
 active_connections: Dict[str, WebSocket] = {}
 download_jobs: Dict[str, dict] = {}
-main_loop: asyncio.AbstractEventLoop = None  # set on startup
+main_loop: asyncio.AbstractEventLoop = None
 
 
 # ============================================================
-# Utility functions
+# Utilities
 # ============================================================
 def clean_filename(name: str) -> str:
-    """Remove illegal characters from filename."""
     name = re.sub(r'[\\/*?:"<>|\n\r\t]', "", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return name[:150]
+    return name[:150] or "video"
 
 
 def format_bytes(num: float) -> str:
@@ -80,7 +89,11 @@ def format_bytes(num: float) -> str:
 
 
 async def send_progress(job_id: str, data: dict):
-    """Send JSON update via WebSocket to the connected client."""
+    """Send update to WebSocket AND store it for HTTP polling fallback."""
+    if job_id in download_jobs:
+        download_jobs[job_id]["last_state"] = data
+        download_jobs[job_id]["last_update"] = time.time()
+
     ws = active_connections.get(job_id)
     if ws is None:
         return
@@ -91,7 +104,6 @@ async def send_progress(job_id: str, data: dict):
 
 
 def progress_hook_factory(job_id: str):
-    """yt-dlp progress hook → forwards events to the WebSocket via the main loop."""
     def hook(d):
         if main_loop is None:
             return
@@ -128,70 +140,10 @@ def progress_hook_factory(job_id: str):
 
 
 # ============================================================
-# Cloudflare / bot-protection bypass — curl_cffi impersonator
-# ============================================================
-def fetch_with_browser_fingerprint(url: str, referer: str = "") -> Optional[str]:
-    """Fetch a URL using a Chrome TLS fingerprint (bypasses Cloudflare).
-
-    Returns HTML text on success, None on failure.
-    """
-    if not HAS_CFFI:
-        return None
-    try:
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": referer or url,
-        }
-        r = cffi_requests.get(
-            url,
-            impersonate="chrome120",
-            headers=headers,
-            timeout=30,
-            allow_redirects=True,
-        )
-        if r.status_code == 200 and len(r.text) > 1000:
-            return r.text
-    except Exception:
-        return None
-    return None
-
-
-def extract_embed_url(html: str, base_domain: str) -> Optional[str]:
-    """Find an embed/video URL inside an HTML page."""
-    if not html:
-        return None
-    # Common patterns used by video sites
-    patterns = [
-        r'"(?:videoUrl|video_url|playUrl|hlsUrl|mp4Url|src)"\s*:\s*"([^"]+)"',
-        r'(?:src|href|data-src)\s*=\s*["\']([^"\']*embed[^"\']*)["\']',
-        r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
-        r'(https?://[^\s"\'<>]+/embed/[^\s"\'<>]+)',
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, re.IGNORECASE)
-        if m:
-            url = m.group(1).replace("\\/", "/").replace("\\u0026", "&")
-            if url.startswith("//"):
-                url = "https:" + url
-            elif url.startswith("/"):
-                url = "https://" + base_domain + url
-            return url
-    return None
-
-
-# ============================================================
-# yt-dlp options builder (shared between metadata + download)
+# yt-dlp options
 # ============================================================
 def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: bool = True) -> dict:
-    """Build a yt-dlp options dict with anti-bot protection.
-
-    job_id              : identifier used for progress callbacks
-    out_template        : output filename template; None for metadata-only
-    with_postprocessors : include the FFmpeg→mp4 postprocessor
-    """
     opts = {
-        # Best video + best audio, fall back to single best file
         "format": "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
         "progress_hooks": [progress_hook_factory(job_id)],
@@ -200,7 +152,6 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
         "no_warnings": True,
         "noprogress": True,
         "concurrent_fragment_downloads": 4,
-        # ===== Anti-bot / Cloudflare bypass =====
         "no_check_certificates": True,
         "http_headers": {
             "User-Agent": (
@@ -208,10 +159,7 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8"
-            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
@@ -221,187 +169,139 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
         },
-        # Optional cookies file (Netscape format) next to main.py
         "cookiefile": str(BASE_DIR / "cookies.txt")
             if (BASE_DIR / "cookies.txt").exists() else None,
-        "retries": 10,
-        "fragment_retries": 10,
-        "socket_timeout": 60,
-        # Universal age-gate bypass (no site-specific naming)
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
         "age_limit": 0,
         "geo_bypass": True,
         "geo_bypass_country": "US",
     }
-
     if out_template:
         opts["outtmpl"] = out_template
     if with_postprocessors:
         opts["postprocessors"] = [
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
         ]
-
-    # Strip None values (older yt-dlp rejects some)
     return {k: v for k, v in opts.items() if v is not None}
 
 
 # ============================================================
-# Background download task
+# Layer 2: curl_cffi — Cloudflare TLS bypass
 # ============================================================
-async def download_video_task(job_id: str, url: str):
-    """Download video with yt-dlp, merge audio+video, output MP4.
-
-    Flow:
-      1) Try yt-dlp directly (works for most sites)
-      2) On Cloudflare/bot error (410/403), use curl_cffi to fetch
-         the page and extract the real embed/mp4 URL, then retry yt-dlp
-      3) If a direct .mp4 URL is found, download it with curl_cffi directly
-    """
-    # Determine base domain for relative-URL resolution
-    base_domain = re.match(r"https?://([^/]+)", url)
-    base_domain = base_domain.group(1) if base_domain else ""
-
-    current_url = url
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            # ---- Step 1: extract metadata first ----
-            meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
-            def extract_meta():
-                with yt_dlp.YoutubeDL(meta_opts) as ydl:
-                    return ydl.extract_info(current_url, download=False)
-
-            info = await asyncio.to_thread(extract_meta)
-            title = clean_filename(info.get("title", "video"))
-            thumbnail = info.get("thumbnail", "") or ""
-            duration = info.get("duration", 0) or 0
-            uploader = info.get("uploader", "") or ""
-
-            await send_progress(job_id, {
-                "type": "info",
-                "title": title,
-                "thumbnail": thumbnail,
-                "duration": duration,
-                "uploader": uploader,
-            })
-
-            # ---- Step 2: download + merge to mp4 ----
-            out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
-            ydl_opts = _build_ydl_opts(
-                job_id,
-                out_template=out_template,
-                with_postprocessors=True,
-            )
-
-            def run_download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([current_url])
-
-            await asyncio.to_thread(run_download)
-
-            # ---- Step 3: locate the produced file ----
-            downloaded_file = None
-            for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3"):
-                candidate = DOWNLOADS_DIR / f"{job_id}{ext}"
-                if candidate.exists():
-                    downloaded_file = candidate
-                    break
-
-            if not downloaded_file:
-                for f in DOWNLOADS_DIR.glob(f"{job_id}*"):
-                    if f.is_file():
-                        downloaded_file = f
-                        break
-
-            if not downloaded_file:
-                raise RuntimeError("لم يتم العثور على الملف بعد التحميل")
-
-            # ---- Step 4: ensure final name is <job_id>.mp4 ----
-            final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
-            if downloaded_file != final_path:
-                if final_path.exists():
-                    final_path.unlink()
-                downloaded_file.rename(final_path)
-
-            file_size = final_path.stat().st_size
-            filename = f"{title}.mp4"
-
-            download_jobs[job_id].update({
-                "file_path": str(final_path),
-                "filename": filename,
-                "file_size": file_size,
-                "completed": True,
-                "completed_at": time.time(),
-            })
-
-            await send_progress(job_id, {
-                "type": "complete",
-                "download_url": f"/download/{job_id}",
-                "filename": filename,
-                "size_text": format_bytes(file_size),
-            })
-            return  # SUCCESS
-
-        except Exception as e:
-            last_error = e
-            err_text = str(e).lower()
-
-            # If it's a Cloudflare/bot block (410/403/401) → try curl_cffi bypass
-            if ("410" in err_text or "403" in err_text or "401" in err_text
-                or "unable to download webpage" in err_text):
-                if HAS_CFFI:
-                    await send_progress(job_id, {
-                        "type": "processing",
-                        "message": "جاري تجاوز حماية الموقع بمتصفح افتراضي..."
-                    })
-                    html = fetch_with_browser_fingerprint(current_url, referer=url)
-                    if html:
-                        new_url = extract_embed_url(html, base_domain)
-                        if new_url and new_url != current_url:
-                            current_url = new_url
-                            continue  # retry yt-dlp with the embed URL
-
-                        # If we found a direct .mp4 URL, download it ourselves
-                        if new_url and new_url.endswith(".mp4"):
-                            await _download_direct_mp4(job_id, new_url, current_url)
-                            return
-                # else: no cffi available, fall through to error
-
-            # Not a recoverable error → report and stop
-            await send_progress(job_id, {
-                "type": "error",
-                "message": f"خطأ أثناء التحميل: {str(e)}"
-            })
-            return
-
-    # All retries exhausted
-    await send_progress(job_id, {
-        "type": "error",
-        "message": f"فشل التحميل بعد عدة محاولات: {last_error}"
-    })
-
-
-async def _download_direct_mp4(job_id: str, mp4_url: str, referer: str):
-    """Download a direct .mp4 URL using curl_cffi (browser-fingerprinted)."""
+def fetch_with_browser_fingerprint(url: str, referer: str = "") -> Optional[str]:
     if not HAS_CFFI:
-        await send_progress(job_id, {
-            "type": "error",
-            "message": "curl_cffi غير متاح لتحميل هذا الرابط"
-        })
-        return
+        return None
+    try:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer or url,
+        }
+        r = cffi_requests.get(
+            url, impersonate="chrome120", headers=headers,
+            timeout=30, allow_redirects=True,
+        )
+        if r.status_code == 200 and len(r.text) > 500:
+            return r.text
+    except Exception:
+        return None
+    return None
 
+
+def find_video_urls_in_html(html: str, base_domain: str) -> List[str]:
+    """Extract candidate video URLs from HTML."""
+    if not html:
+        return []
+    urls = []
+    patterns = [
+        r'"(?:videoUrl|video_url|playUrl|hlsUrl|mp4Url|src)"\s*:\s*"([^"]+)"',
+        r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        r'(https?://[^\s"\'<>]+/embed/[^\s"\'<>]+)',
+        r'(?:src|href|data-src)\s*=\s*["\']([^"\']*(?:video|play|watch)[^"\']*)["\']',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.IGNORECASE):
+            url = m.group(1).replace("\\/", "/").replace("\\u0026", "&")
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = "https://" + base_domain + url
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+# ============================================================
+# Layer 3: Playwright headless browser
+# ============================================================
+async def fetch_with_playwright(url: str, timeout_ms: int = 30000) -> Optional[str]:
+    """Open URL in real headless Chrome, wait for network idle, return HTML."""
+    if not HAS_PLAYWRIGHT:
+        return None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 720},
+                locale="en-US",
+            )
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+            """)
+            page = await context.new_page()
+
+            video_urls_found = []
+            async def on_request(req):
+                if any(ext in req.url.lower() for ext in [".mp4", ".m3u8", "/video/", "videoplayback"]):
+                    video_urls_found.append(req.url)
+            page.on("request", on_request)
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout_ms // 2)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+                html = await page.content()
+            except Exception:
+                html = None
+
+            await context.close()
+            await browser.close()
+
+            if video_urls_found:
+                return "<!--VIDEO_URLS-->\n" + "\n".join(video_urls_found) + "\n<!--/VIDEO_URLS-->\n" + (html or "")
+            return html
+    except Exception:
+        return None
+
+
+# ============================================================
+# Layer 4: Direct MP4 download with curl_cffi
+# ============================================================
+async def download_direct_mp4(job_id: str, mp4_url: str, referer: str, title: str = "video"):
     final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
     try:
         await send_progress(job_id, {
-            "type": "info",
-            "title": "video",
-            "thumbnail": "",
-            "duration": 0,
-            "uploader": "",
-        })
-        await send_progress(job_id, {
             "type": "processing",
-            "message": "جاري تحميل ملف MP4 المباشر..."
+            "message": "جاري تحميل ملف الفيديو المباشر..."
         })
 
         def do_download():
@@ -412,12 +312,8 @@ async def _download_direct_mp4(job_id: str, mp4_url: str, referer: str):
                 "Range": "bytes=0-",
             }
             with cffi_requests.get(
-                mp4_url,
-                impersonate="chrome120",
-                headers=headers,
-                timeout=60,
-                stream=True,
-                allow_redirects=True,
+                mp4_url, impersonate="chrome120", headers=headers,
+                timeout=120, stream=True, allow_redirects=True,
             ) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0)) or 0
@@ -452,45 +348,219 @@ async def _download_direct_mp4(job_id: str, mp4_url: str, referer: str):
         await asyncio.to_thread(do_download)
 
         file_size = final_path.stat().st_size
+        filename = f"{clean_filename(title)}.mp4"
         download_jobs[job_id].update({
             "file_path": str(final_path),
-            "filename": "video.mp4",
+            "filename": filename,
             "file_size": file_size,
             "completed": True,
             "completed_at": time.time(),
         })
-
         await send_progress(job_id, {
             "type": "complete",
             "download_url": f"/download/{job_id}",
-            "filename": "video.mp4",
+            "filename": filename,
             "size_text": format_bytes(file_size),
         })
-
+        return True
     except Exception as e:
         await send_progress(job_id, {
             "type": "error",
-            "message": f"خطأ في التحميل المباشر: {str(e)}"
+            "message": f"فشل التحميل المباشر: {str(e)}"
+        })
+        return False
+
+
+# ============================================================
+# Finalize a yt-dlp download
+# ============================================================
+async def finalize_ydl_download(job_id: str, title: str) -> bool:
+    downloaded_file = None
+    for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3"):
+        candidate = DOWNLOADS_DIR / f"{job_id}{ext}"
+        if candidate.exists():
+            downloaded_file = candidate
+            break
+    if not downloaded_file:
+        for f in DOWNLOADS_DIR.glob(f"{job_id}*"):
+            if f.is_file():
+                downloaded_file = f
+                break
+    if not downloaded_file:
+        return False
+
+    final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
+    if downloaded_file != final_path:
+        if final_path.exists():
+            final_path.unlink()
+        downloaded_file.rename(final_path)
+
+    file_size = final_path.stat().st_size
+    filename = f"{clean_filename(title)}.mp4"
+    download_jobs[job_id].update({
+        "file_path": str(final_path),
+        "filename": filename,
+        "file_size": file_size,
+        "completed": True,
+        "completed_at": time.time(),
+    })
+    await send_progress(job_id, {
+        "type": "complete",
+        "download_url": f"/download/{job_id}",
+        "filename": filename,
+        "size_text": format_bytes(file_size),
+    })
+    return True
+
+
+# ============================================================
+# Main download task — multi-layer fallback
+# ============================================================
+async def download_video_task(job_id: str, url: str):
+    base_domain_match = re.match(r"https?://([^/]+)", url)
+    base_domain = base_domain_match.group(1) if base_domain_match else ""
+
+    # Send immediate "preparing" status so UI doesn't freeze at 0%
+    await send_progress(job_id, {
+        "type": "info",
+        "title": "جاري التحضير...",
+        "thumbnail": "",
+        "duration": 0,
+        "uploader": "",
+    })
+    await send_progress(job_id, {
+        "type": "processing",
+        "message": "جاري الاتصال بالموقع..."
+    })
+
+    # ====== LAYER 1: yt-dlp ======
+    try:
+        await send_progress(job_id, {
+            "type": "processing",
+            "message": "المحاولة الأولى: yt-dlp..."
+        })
+        meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
+
+        def extract_meta():
+            with yt_dlp.YoutubeDL(meta_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await asyncio.to_thread(extract_meta)
+        title = clean_filename(info.get("title", "video"))
+        thumbnail = info.get("thumbnail", "") or ""
+        duration = info.get("duration", 0) or 0
+        uploader = info.get("uploader", "") or ""
+
+        await send_progress(job_id, {
+            "type": "info",
+            "title": title,
+            "thumbnail": thumbnail,
+            "duration": duration,
+            "uploader": uploader,
         })
 
+        out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
+        ydl_opts = _build_ydl_opts(job_id, out_template=out_template, with_postprocessors=True)
+
+        def run_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+        await asyncio.to_thread(run_download)
+
+        if await finalize_ydl_download(job_id, title):
+            return
+    except Exception as e:
+        err_text = str(e).lower()
+        is_bot_block = any(code in err_text for code in ["410", "403", "401", "unable to download"])
+        if not is_bot_block:
+            await send_progress(job_id, {
+                "type": "error",
+                "message": f"خطأ أثناء التحميل: {str(e)[:200]}"
+            })
+            return
+
+    # ====== LAYER 2: curl_cffi ======
+    if HAS_CFFI:
+        await send_progress(job_id, {
+            "type": "processing",
+            "message": "المحاولة الثانية: تجاوز حماية الموقع..."
+        })
+        html = await asyncio.to_thread(fetch_with_browser_fingerprint, url, url)
+        if html:
+            video_urls = find_video_urls_in_html(html, base_domain)
+            for vurl in video_urls:
+                if ".mp4" in vurl.lower():
+                    await send_progress(job_id, {
+                        "type": "info",
+                        "title": "video",
+                        "thumbnail": "",
+                        "duration": 0,
+                        "uploader": "",
+                    })
+                    if await download_direct_mp4(job_id, vurl, url):
+                        return
+            for vurl in video_urls:
+                try:
+                    out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
+                    ydl_opts = _build_ydl_opts(job_id, out_template=out_template, with_postprocessors=True)
+
+                    def run_dl(u=vurl):
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([u])
+
+                    await asyncio.to_thread(run_dl)
+                    if await finalize_ydl_download(job_id, "video"):
+                        return
+                except Exception:
+                    continue
+
+    # ====== LAYER 3: Playwright ======
+    if HAS_PLAYWRIGHT:
+        await send_progress(job_id, {
+            "type": "processing",
+            "message": "المحاولة الثالثة: متصفح افتراضي كامل..."
+        })
+        try:
+            html = await fetch_with_playwright(url, timeout_ms=30000)
+            if html:
+                if "<!--VIDEO_URLS-->" in html:
+                    vu_section = html.split("<!--VIDEO_URLS-->")[1].split("<!--/VIDEO_URLS-->")[0]
+                    for vurl in vu_section.strip().split("\n"):
+                        vurl = vurl.strip()
+                        if vurl and ".mp4" in vurl.lower():
+                            if await download_direct_mp4(job_id, vurl, url):
+                                return
+
+                video_urls = find_video_urls_in_html(html, base_domain)
+                for vurl in video_urls:
+                    if ".mp4" in vurl.lower():
+                        if await download_direct_mp4(job_id, vurl, url):
+                            return
+        except Exception:
+            pass
+
+    # ====== ALL LAYERS FAILED ======
+    await send_progress(job_id, {
+        "type": "error",
+        "message": "تعذّر تحميل الفيديو بعد تجربة جميع الطرق المتاحة. تأكد من صحة الرابط أو جرّب رابطاً آخر."
+    })
+
 
 # ============================================================
-# Periodic cleanup of old files
+# Cleanup task
 # ============================================================
 async def cleanup_old_files():
-    """Delete downloaded files older than FILE_LIFETIME."""
     while True:
-        await asyncio.sleep(600)  # every 10 min
+        await asyncio.sleep(600)
         now = time.time()
         for job_id, job in list(download_jobs.items()):
             completed_at = job.get("completed_at")
             if completed_at and (now - completed_at) > FILE_LIFETIME:
-                file_path = job.get("file_path")
-                if file_path and Path(file_path).exists():
-                    try:
-                        Path(file_path).unlink()
-                    except Exception:
-                        pass
+                fp = job.get("file_path")
+                if fp and Path(fp).exists():
+                    try: Path(fp).unlink()
+                    except Exception: pass
                 download_jobs.pop(job_id, None)
 
 
@@ -506,14 +576,11 @@ async def on_startup():
 
 @app.get("/")
 async def root():
-    """Serve the main HTML page."""
-    index_path = STATIC_DIR / "index.html"
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
 
 @app.post("/api/download")
 async def start_download(request: Request, background_tasks: BackgroundTasks):
-    """Accept a URL, return a job_id, start background download."""
     try:
         body = await request.json()
     except Exception:
@@ -530,60 +597,88 @@ async def start_download(request: Request, background_tasks: BackgroundTasks):
         "url": url,
         "completed": False,
         "created_at": time.time(),
+        "last_state": None,
+        "last_update": time.time(),
     }
 
     background_tasks.add_task(download_video_task, job_id, url)
-
     return {"job_id": job_id, "message": "بدأ التحميل"}
+
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    """HTTP polling fallback — returns the latest state for a job."""
+    job = download_jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    return {
+        "job_id": job_id,
+        "completed": job.get("completed", False),
+        "last_state": job.get("last_state"),
+        "last_update": job.get("last_update"),
+    }
 
 
 @app.get("/download/{job_id}")
 async def download_file(job_id: str):
-    """Serve the final MP4 file for download."""
     job = download_jobs.get(job_id)
     if not job or not job.get("completed"):
-        return JSONResponse({"error": "الملف غير متاح أو لم يكتمل بعد"}, status_code=404)
-
+        return JSONResponse({"error": "الملف غير متاح"}, status_code=404)
     file_path = job["file_path"]
     if not Path(file_path).exists():
         return JSONResponse({"error": "انتهت صلاحية الملف"}, status_code=404)
-
     return FileResponse(
-        file_path,
-        media_type="video/mp4",
+        file_path, media_type="video/mp4",
         filename=job.get("filename", "video.mp4"),
     )
 
 
 @app.websocket("/ws/{job_id}")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
-    """WebSocket channel for real-time progress updates."""
+    """WebSocket with heartbeat — sends a ping every 5s to keep UI alive."""
     await websocket.accept()
     active_connections[job_id] = websocket
+
+    job = download_jobs.get(job_id)
+    if job and job.get("last_state"):
+        try:
+            await websocket.send_json(job["last_state"])
+        except Exception:
+            pass
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await websocket.send_json({"type": "heartbeat", "t": time.time()})
+            except Exception:
+                return
+
+    hb_task = asyncio.create_task(heartbeat())
     try:
         while True:
-            # keep alive; client can ping
             await websocket.receive_text()
     except WebSocketDisconnect:
-        active_connections.pop(job_id, None)
+        pass
     except Exception:
+        pass
+    finally:
+        hb_task.cancel()
         active_connections.pop(job_id, None)
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "layers": {
+            "yt_dlp": True,
+            "curl_cffi": HAS_CFFI,
+            "playwright": HAS_PLAYWRIGHT,
+        }
+    }
 
 
-# ============================================================
-# Entrypoint
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
-            )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
