@@ -1,5 +1,5 @@
 """
-Video Downloader Backend — Multi-layer fallback engine
+Video Downloader Backend â€” Multi-layer fallback engine
 ======================================================
 Layer 1: yt-dlp (works for 95% of sites)
 Layer 2: curl_cffi (Cloudflare TLS-fingerprint bypass)
@@ -43,7 +43,7 @@ except ImportError:
 # Configuration
 # ============================================================
 BASE_DIR = Path(__file__).parent.resolve()
-STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR = BASE_DIR / "Static"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
@@ -118,12 +118,12 @@ def progress_hook_factory(job_id: str):
                 "type": "progress",
                 "percentage": round(percentage, 2),
                 "speed": speed,
-                "speed_text": format_bytes(speed) + "/s" if speed else "—",
+                "speed_text": format_bytes(speed) + "/s" if speed else "â€”",
                 "eta": eta,
                 "downloaded": downloaded,
                 "downloaded_text": format_bytes(downloaded),
                 "total": total,
-                "total_text": format_bytes(total) if total else "—",
+                "total_text": format_bytes(total) if total else "â€”",
             }
             asyncio.run_coroutine_threadsafe(
                 send_progress(job_id, payload), main_loop
@@ -132,7 +132,7 @@ def progress_hook_factory(job_id: str):
             asyncio.run_coroutine_threadsafe(
                 send_progress(job_id, {
                     "type": "processing",
-                    "message": "جاري دمج الصوت والفيديو وتحويل الملف إلى MP4..."
+                    "message": "Ø¬Ø§Ø±ÙŠ Ø¯Ù…Ø¬ Ø§Ù„ØµÙˆØª ÙˆØ§Ù„ÙÙŠØ¯ÙŠÙˆ ÙˆØªØ­ÙˆÙŠÙ„ Ø§Ù„Ù…Ù„Ù Ø¥Ù„Ù‰ MP4..."
                 }),
                 main_loop,
             )
@@ -174,7 +174,6 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
         "retries": 5,
         "fragment_retries": 5,
         "socket_timeout": 30,
-        "age_limit": 0,
         "geo_bypass": True,
         "geo_bypass_country": "US",
     }
@@ -188,7 +187,7 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
 
 
 # ============================================================
-# Layer 2: curl_cffi — Cloudflare TLS bypass
+# Layer 2: curl_cffi â€” Cloudflare TLS bypass
 # ============================================================
 def fetch_with_browser_fingerprint(url: str, referer: str = "") -> Optional[str]:
     if not HAS_CFFI:
@@ -301,7 +300,7 @@ async def download_direct_mp4(job_id: str, mp4_url: str, referer: str, title: st
     try:
         await send_progress(job_id, {
             "type": "processing",
-            "message": "جاري تحميل ملف الفيديو المباشر..."
+            "message": "Ø¬Ø§Ø±ÙŠ ØªØ­Ù…ÙŠÙ„ Ù…Ù„Ù Ø§Ù„ÙÙŠØ¯ÙŠÙˆ Ø§Ù„Ù…Ø¨Ø§Ø´Ø±..."
         })
 
         def do_download():
@@ -311,39 +310,39 @@ async def download_direct_mp4(job_id: str, mp4_url: str, referer: str, title: st
                 "Referer": referer,
                 "Range": "bytes=0-",
             }
-            with cffi_requests.get(
+            r = cffi_requests.get(
                 mp4_url, impersonate="chrome120", headers=headers,
                 timeout=120, stream=True, allow_redirects=True,
-            ) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("content-length", 0)) or 0
-                downloaded = 0
-                last_update = 0
-                start_time = time.time()
-                with open(final_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=64 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            now = time.time()
-                            if now - last_update > 0.3:
-                                last_update = now
-                                pct = (downloaded / total * 100) if total else 0
-                                speed = downloaded / (now - start_time) if now > start_time else 0
-                                payload = {
-                                    "type": "progress",
-                                    "percentage": round(pct, 2),
-                                    "speed": speed,
-                                    "speed_text": format_bytes(speed) + "/s" if speed else "—",
-                                    "eta": (total - downloaded) / speed if speed else 0,
-                                    "downloaded": downloaded,
-                                    "downloaded_text": format_bytes(downloaded),
-                                    "total": total,
-                                    "total_text": format_bytes(total) if total else "—",
-                                }
-                                asyncio.run_coroutine_threadsafe(
-                                    send_progress(job_id, payload), main_loop
-                                )
+            )
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0)) or 0
+            downloaded = 0
+            last_update = 0
+            start_time = time.time()
+            with open(final_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_update > 0.3:
+                            last_update = now
+                            pct = (downloaded / total * 100) if total else 0
+                            speed = downloaded / (now - start_time) if now > start_time else 0
+                            payload = {
+                                "type": "progress",
+                                "percentage": round(pct, 2),
+                                "speed": speed,
+                                "speed_text": format_bytes(speed) + "/s" if speed else "â€”",
+                                "eta": (total - downloaded) / speed if speed else 0,
+                                "downloaded": downloaded,
+                                "downloaded_text": format_bytes(downloaded),
+                                "total": total,
+                                "total_text": format_bytes(total) if total else "â€”",
+                            }
+                            asyncio.run_coroutine_threadsafe(
+                                send_progress(job_id, payload), main_loop
+                            )
 
         await asyncio.to_thread(do_download)
 
@@ -366,7 +365,7 @@ async def download_direct_mp4(job_id: str, mp4_url: str, referer: str, title: st
     except Exception as e:
         await send_progress(job_id, {
             "type": "error",
-            "message": f"فشل التحميل المباشر: {str(e)}"
+            "message": f"ÙØ´Ù„ Ø§Ù„ØªØ­Ù…ÙŠÙ„ Ø§Ù„Ù…Ø¨Ø§Ø´Ø±: {str(e)}"
         })
         return False
 
@@ -387,6 +386,10 @@ async def finalize_ydl_download(job_id: str, title: str) -> bool:
                 downloaded_file = f
                 break
     if not downloaded_file:
+        return False
+
+    if downloaded_file.stat().st_size == 0:
+        downloaded_file.unlink(missing_ok=True)
         return False
 
     final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
@@ -414,7 +417,7 @@ async def finalize_ydl_download(job_id: str, title: str) -> bool:
 
 
 # ============================================================
-# Main download task — multi-layer fallback
+# Main download task â€” multi-layer fallback
 # ============================================================
 async def download_video_task(job_id: str, url: str):
     base_domain_match = re.match(r"https?://([^/]+)", url)
@@ -423,21 +426,21 @@ async def download_video_task(job_id: str, url: str):
     # Send immediate "preparing" status so UI doesn't freeze at 0%
     await send_progress(job_id, {
         "type": "info",
-        "title": "جاري التحضير...",
+        "title": "Ø¬Ø§Ø±ÙŠ Ø§Ù„ØªØ­Ø¶ÙŠØ±...",
         "thumbnail": "",
         "duration": 0,
         "uploader": "",
     })
     await send_progress(job_id, {
         "type": "processing",
-        "message": "جاري الاتصال بالموقع..."
+        "message": "Ø¬Ø§Ø±ÙŠ Ø§Ù„Ø§ØªØµØ§Ù„ Ø¨Ø§Ù„Ù…ÙˆÙ‚Ø¹..."
     })
 
     # ====== LAYER 1: yt-dlp ======
     try:
         await send_progress(job_id, {
             "type": "processing",
-            "message": "المحاولة الأولى: yt-dlp..."
+            "message": "Ø§Ù„Ù…Ø­Ø§ÙˆÙ„Ø© Ø§Ù„Ø£ÙˆÙ„Ù‰: yt-dlp..."
         })
         meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
 
@@ -476,7 +479,7 @@ async def download_video_task(job_id: str, url: str):
         if not is_bot_block:
             await send_progress(job_id, {
                 "type": "error",
-                "message": f"خطأ أثناء التحميل: {str(e)[:200]}"
+                "message": f"Ø®Ø·Ø£ Ø£Ø«Ù†Ø§Ø¡ Ø§Ù„ØªØ­Ù…ÙŠÙ„: {str(e)[:200]}"
             })
             return
 
@@ -484,7 +487,7 @@ async def download_video_task(job_id: str, url: str):
     if HAS_CFFI:
         await send_progress(job_id, {
             "type": "processing",
-            "message": "المحاولة الثانية: تجاوز حماية الموقع..."
+            "message": "Ø§Ù„Ù…Ø­Ø§ÙˆÙ„Ø© Ø§Ù„Ø«Ø§Ù†ÙŠØ©: ØªØ¬Ø§ÙˆØ² Ø­Ù…Ø§ÙŠØ© Ø§Ù„Ù…ÙˆÙ‚Ø¹..."
         })
         html = await asyncio.to_thread(fetch_with_browser_fingerprint, url, url)
         if html:
@@ -519,7 +522,7 @@ async def download_video_task(job_id: str, url: str):
     if HAS_PLAYWRIGHT:
         await send_progress(job_id, {
             "type": "processing",
-            "message": "المحاولة الثالثة: متصفح افتراضي كامل..."
+            "message": "Ø§Ù„Ù…Ø­Ø§ÙˆÙ„Ø© Ø§Ù„Ø«Ø§Ù„Ø«Ø©: Ù…ØªØµÙØ­ Ø§ÙØªØ±Ø§Ø¶ÙŠ ÙƒØ§Ù…Ù„..."
         })
         try:
             html = await fetch_with_playwright(url, timeout_ms=30000)
@@ -543,7 +546,7 @@ async def download_video_task(job_id: str, url: str):
     # ====== ALL LAYERS FAILED ======
     await send_progress(job_id, {
         "type": "error",
-        "message": "تعذّر تحميل الفيديو بعد تجربة جميع الطرق المتاحة. تأكد من صحة الرابط أو جرّب رابطاً آخر."
+        "message": "ØªØ¹Ø°Ù‘Ø± ØªØ­Ù…ÙŠÙ„ Ø§Ù„ÙÙŠØ¯ÙŠÙˆ Ø¨Ø¹Ø¯ ØªØ¬Ø±Ø¨Ø© Ø¬Ù…ÙŠØ¹ Ø§Ù„Ø·Ø±Ù‚ Ø§Ù„Ù…ØªØ§Ø­Ø©. ØªØ£ÙƒØ¯ Ù…Ù† ØµØ­Ø© Ø§Ù„Ø±Ø§Ø¨Ø· Ø£Ùˆ Ø¬Ø±Ù‘Ø¨ Ø±Ø§Ø¨Ø·Ø§Ù‹ Ø¢Ø®Ø±."
     })
 
 
@@ -584,13 +587,13 @@ async def start_download(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "طلب غير صالح"}, status_code=400)
+        return JSONResponse({"error": "Ø·Ù„Ø¨ ØºÙŠØ± ØµØ§Ù„Ø­"}, status_code=400)
 
     url = (body.get("url") or "").strip()
     if not url:
-        return JSONResponse({"error": "الرابط مطلوب"}, status_code=400)
+        return JSONResponse({"error": "Ø§Ù„Ø±Ø§Ø¨Ø· Ù…Ø·Ù„ÙˆØ¨"}, status_code=400)
     if not re.match(r"^https?://", url):
-        return JSONResponse({"error": "يجب أن يبدأ الرابط بـ http:// أو https://"}, status_code=400)
+        return JSONResponse({"error": "ÙŠØ¬Ø¨ Ø£Ù† ÙŠØ¨Ø¯Ø£ Ø§Ù„Ø±Ø§Ø¨Ø· Ø¨Ù€ http:// Ø£Ùˆ https://"}, status_code=400)
 
     job_id = str(uuid.uuid4())[:8]
     download_jobs[job_id] = {
@@ -602,12 +605,12 @@ async def start_download(request: Request, background_tasks: BackgroundTasks):
     }
 
     background_tasks.add_task(download_video_task, job_id, url)
-    return {"job_id": job_id, "message": "بدأ التحميل"}
+    return {"job_id": job_id, "message": "Ø¨Ø¯Ø£ Ø§Ù„ØªØ­Ù…ÙŠÙ„"}
 
 
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str):
-    """HTTP polling fallback — returns the latest state for a job."""
+    """HTTP polling fallback â€” returns the latest state for a job."""
     job = download_jobs.get(job_id)
     if not job:
         return JSONResponse({"error": "job not found"}, status_code=404)
@@ -623,10 +626,10 @@ async def get_status(job_id: str):
 async def download_file(job_id: str):
     job = download_jobs.get(job_id)
     if not job or not job.get("completed"):
-        return JSONResponse({"error": "الملف غير متاح"}, status_code=404)
+        return JSONResponse({"error": "Ø§Ù„Ù…Ù„Ù ØºÙŠØ± Ù…ØªØ§Ø­"}, status_code=404)
     file_path = job["file_path"]
     if not Path(file_path).exists():
-        return JSONResponse({"error": "انتهت صلاحية الملف"}, status_code=404)
+        return JSONResponse({"error": "Ø§Ù†ØªÙ‡Øª ØµÙ„Ø§Ø­ÙŠØ© Ø§Ù„Ù…Ù„Ù"}, status_code=404)
     return FileResponse(
         file_path, media_type="video/mp4",
         filename=job.get("filename", "video.mp4"),
@@ -635,7 +638,7 @@ async def download_file(job_id: str):
 
 @app.websocket("/ws/{job_id}")
 async def websocket_endpoint(websocket: WebSocket, job_id: str):
-    """WebSocket with heartbeat — sends a ping every 5s to keep UI alive."""
+    """WebSocket with heartbeat â€” sends a ping every 5s to keep UI alive."""
     await websocket.accept()
     active_connections[job_id] = websocket
 
