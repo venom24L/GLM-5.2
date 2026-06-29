@@ -117,14 +117,80 @@ def progress_hook_factory(job_id: str):
 
 
 # ============================================================
+# yt-dlp options builder (shared between metadata + download)
+# ============================================================
+def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: bool = True) -> dict:
+    """Build a yt-dlp options dict with anti-bot protection.
+
+    job_id              : identifier used for progress callbacks
+    out_template        : output filename template; None for metadata-only
+    with_postprocessors : include the FFmpeg→mp4 postprocessor
+    """
+    opts = {
+        # Best video + best audio, fall back to single best file
+        "format": "bestvideo*+bestaudio/best",
+        "merge_output_format": "mp4",
+        "progress_hooks": [progress_hook_factory(job_id)],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "concurrent_fragment_downloads": 4,
+        # ===== Anti-bot / Cloudflare bypass =====
+        "no_check_certificates": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        },
+        # Optional cookies file (Netscape format) next to main.py
+        "cookiefile": str(BASE_DIR / "cookies.txt")
+            if (BASE_DIR / "cookies.txt").exists() else None,
+        "retries": 10,
+        "fragment_retries": 10,
+        "socket_timeout": 60,
+        # Universal age-gate bypass (no site-specific naming)
+        "age_limit": 0,
+        "geo_bypass": True,
+        "geo_bypass_country": "US",
+    }
+
+    if out_template:
+        opts["outtmpl"] = out_template
+    if with_postprocessors:
+        opts["postprocessors"] = [
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
+        ]
+
+    # Strip None values (older yt-dlp rejects some)
+    return {k: v for k, v in opts.items() if v is not None}
+
+
+# ============================================================
 # Background download task
 # ============================================================
 async def download_video_task(job_id: str, url: str):
     """Download video with yt-dlp, merge audio+video, output MP4."""
     try:
         # ---- Step 1: extract metadata first ----
+        # Use the same anti-bot headers as the download step.
+        meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
         def extract_meta():
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            with yt_dlp.YoutubeDL(meta_opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
         info = await asyncio.to_thread(extract_meta)
@@ -143,25 +209,11 @@ async def download_video_task(job_id: str, url: str):
 
         # ---- Step 2: download + merge to mp4 ----
         out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
-        ydl_opts = {
-            # Best video + best audio, fall back to single best file
-            "format": "bestvideo*+bestaudio/best",
-            "merge_output_format": "mp4",
-            "outtmpl": out_template,
-            "progress_hooks": [progress_hook_factory(job_id)],
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "concurrent_fragment_downloads": 4,
-            # ensure final container is mp4
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                }
-            ],
-        }
+        ydl_opts = _build_ydl_opts(
+            job_id,
+            out_template=out_template,
+            with_postprocessors=True,
+        )
 
         def run_download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -336,4 +388,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="info",
-          )
+                    )
