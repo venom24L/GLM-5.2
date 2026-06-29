@@ -1,6 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
-yt-dlp==2024.10.7
+# Use yt-dlp nightly/dev branch — extractors are updated daily
+# (stable releases lag weeks behind site-side changes)
+yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz
 aiofiles==24.1.0
 python-multipart==0.0.12
 websockets==13.1
+# Browser-fingerprint HTTP client — bypasses Cloudflare TLS fingerprinting
+curl_cffi>=0.7.0
