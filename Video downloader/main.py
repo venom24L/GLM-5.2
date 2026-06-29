@@ -8,14 +8,25 @@ import re
 import uuid
 import time
 import asyncio
+import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import yt_dlp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+
+# Silent logger for yt-dlp noise
+logging.getLogger("yt_dlp").setLevel(logging.ERROR)
+
+# Optional: curl_cffi for Cloudflare TLS-fingerprint bypass
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
 
 # ============================================================
 # Configuration
@@ -117,6 +128,59 @@ def progress_hook_factory(job_id: str):
 
 
 # ============================================================
+# Cloudflare / bot-protection bypass — curl_cffi impersonator
+# ============================================================
+def fetch_with_browser_fingerprint(url: str, referer: str = "") -> Optional[str]:
+    """Fetch a URL using a Chrome TLS fingerprint (bypasses Cloudflare).
+
+    Returns HTML text on success, None on failure.
+    """
+    if not HAS_CFFI:
+        return None
+    try:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer or url,
+        }
+        r = cffi_requests.get(
+            url,
+            impersonate="chrome120",
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+        if r.status_code == 200 and len(r.text) > 1000:
+            return r.text
+    except Exception:
+        return None
+    return None
+
+
+def extract_embed_url(html: str, base_domain: str) -> Optional[str]:
+    """Find an embed/video URL inside an HTML page."""
+    if not html:
+        return None
+    # Common patterns used by video sites
+    patterns = [
+        r'"(?:videoUrl|video_url|playUrl|hlsUrl|mp4Url|src)"\s*:\s*"([^"]+)"',
+        r'(?:src|href|data-src)\s*=\s*["\']([^"\']*embed[^"\']*)["\']',
+        r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        r'(https?://[^\s"\'<>]+/embed/[^\s"\'<>]+)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            url = m.group(1).replace("\\/", "/").replace("\\u0026", "&")
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = "https://" + base_domain + url
+            return url
+    return None
+
+
+# ============================================================
 # yt-dlp options builder (shared between metadata + download)
 # ============================================================
 def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: bool = True) -> dict:
@@ -184,79 +248,213 @@ def _build_ydl_opts(job_id: str, out_template: str = None, with_postprocessors: 
 # Background download task
 # ============================================================
 async def download_video_task(job_id: str, url: str):
-    """Download video with yt-dlp, merge audio+video, output MP4."""
-    try:
-        # ---- Step 1: extract metadata first ----
-        # Use the same anti-bot headers as the download step.
-        meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
-        def extract_meta():
-            with yt_dlp.YoutubeDL(meta_opts) as ydl:
-                return ydl.extract_info(url, download=False)
+    """Download video with yt-dlp, merge audio+video, output MP4.
 
-        info = await asyncio.to_thread(extract_meta)
-        title = clean_filename(info.get("title", "video"))
-        thumbnail = info.get("thumbnail", "") or ""
-        duration = info.get("duration", 0) or 0
-        uploader = info.get("uploader", "") or ""
+    Flow:
+      1) Try yt-dlp directly (works for most sites)
+      2) On Cloudflare/bot error (410/403), use curl_cffi to fetch
+         the page and extract the real embed/mp4 URL, then retry yt-dlp
+      3) If a direct .mp4 URL is found, download it with curl_cffi directly
+    """
+    # Determine base domain for relative-URL resolution
+    base_domain = re.match(r"https?://([^/]+)", url)
+    base_domain = base_domain.group(1) if base_domain else ""
 
-        await send_progress(job_id, {
-            "type": "info",
-            "title": title,
-            "thumbnail": thumbnail,
-            "duration": duration,
-            "uploader": uploader,
-        })
+    current_url = url
+    last_error = None
 
-        # ---- Step 2: download + merge to mp4 ----
-        out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
-        ydl_opts = _build_ydl_opts(
-            job_id,
-            out_template=out_template,
-            with_postprocessors=True,
-        )
+    for attempt in range(3):
+        try:
+            # ---- Step 1: extract metadata first ----
+            meta_opts = _build_ydl_opts(job_id, out_template=None, with_postprocessors=False)
+            def extract_meta():
+                with yt_dlp.YoutubeDL(meta_opts) as ydl:
+                    return ydl.extract_info(current_url, download=False)
 
-        def run_download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            info = await asyncio.to_thread(extract_meta)
+            title = clean_filename(info.get("title", "video"))
+            thumbnail = info.get("thumbnail", "") or ""
+            duration = info.get("duration", 0) or 0
+            uploader = info.get("uploader", "") or ""
 
-        await asyncio.to_thread(run_download)
+            await send_progress(job_id, {
+                "type": "info",
+                "title": title,
+                "thumbnail": thumbnail,
+                "duration": duration,
+                "uploader": uploader,
+            })
 
-        # ---- Step 3: locate the produced file ----
-        downloaded_file = None
-        # look for mp4 first (preferred), then other containers
-        for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3"):
-            candidate = DOWNLOADS_DIR / f"{job_id}{ext}"
-            if candidate.exists():
-                downloaded_file = candidate
-                break
+            # ---- Step 2: download + merge to mp4 ----
+            out_template = str(DOWNLOADS_DIR / f"{job_id}.%(ext)s")
+            ydl_opts = _build_ydl_opts(
+                job_id,
+                out_template=out_template,
+                with_postprocessors=True,
+            )
 
-        if not downloaded_file:
-            # fallback: any file starting with job_id
-            for f in DOWNLOADS_DIR.glob(f"{job_id}*"):
-                if f.is_file():
-                    downloaded_file = f
+            def run_download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([current_url])
+
+            await asyncio.to_thread(run_download)
+
+            # ---- Step 3: locate the produced file ----
+            downloaded_file = None
+            for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3"):
+                candidate = DOWNLOADS_DIR / f"{job_id}{ext}"
+                if candidate.exists():
+                    downloaded_file = candidate
                     break
 
-        if not downloaded_file:
+            if not downloaded_file:
+                for f in DOWNLOADS_DIR.glob(f"{job_id}*"):
+                    if f.is_file():
+                        downloaded_file = f
+                        break
+
+            if not downloaded_file:
+                raise RuntimeError("لم يتم العثور على الملف بعد التحميل")
+
+            # ---- Step 4: ensure final name is <job_id>.mp4 ----
+            final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
+            if downloaded_file != final_path:
+                if final_path.exists():
+                    final_path.unlink()
+                downloaded_file.rename(final_path)
+
+            file_size = final_path.stat().st_size
+            filename = f"{title}.mp4"
+
+            download_jobs[job_id].update({
+                "file_path": str(final_path),
+                "filename": filename,
+                "file_size": file_size,
+                "completed": True,
+                "completed_at": time.time(),
+            })
+
+            await send_progress(job_id, {
+                "type": "complete",
+                "download_url": f"/download/{job_id}",
+                "filename": filename,
+                "size_text": format_bytes(file_size),
+            })
+            return  # SUCCESS
+
+        except Exception as e:
+            last_error = e
+            err_text = str(e).lower()
+
+            # If it's a Cloudflare/bot block (410/403/401) → try curl_cffi bypass
+            if ("410" in err_text or "403" in err_text or "401" in err_text
+                or "unable to download webpage" in err_text):
+                if HAS_CFFI:
+                    await send_progress(job_id, {
+                        "type": "processing",
+                        "message": "جاري تجاوز حماية الموقع بمتصفح افتراضي..."
+                    })
+                    html = fetch_with_browser_fingerprint(current_url, referer=url)
+                    if html:
+                        new_url = extract_embed_url(html, base_domain)
+                        if new_url and new_url != current_url:
+                            current_url = new_url
+                            continue  # retry yt-dlp with the embed URL
+
+                        # If we found a direct .mp4 URL, download it ourselves
+                        if new_url and new_url.endswith(".mp4"):
+                            await _download_direct_mp4(job_id, new_url, current_url)
+                            return
+                # else: no cffi available, fall through to error
+
+            # Not a recoverable error → report and stop
             await send_progress(job_id, {
                 "type": "error",
-                "message": "لم يتم العثور على الملف بعد التحميل"
+                "message": f"خطأ أثناء التحميل: {str(e)}"
             })
             return
 
-        # ---- Step 4: ensure final name is <job_id>.mp4 ----
-        final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
-        if downloaded_file != final_path:
-            if final_path.exists():
-                final_path.unlink()
-            downloaded_file.rename(final_path)
+    # All retries exhausted
+    await send_progress(job_id, {
+        "type": "error",
+        "message": f"فشل التحميل بعد عدة محاولات: {last_error}"
+    })
+
+
+async def _download_direct_mp4(job_id: str, mp4_url: str, referer: str):
+    """Download a direct .mp4 URL using curl_cffi (browser-fingerprinted)."""
+    if not HAS_CFFI:
+        await send_progress(job_id, {
+            "type": "error",
+            "message": "curl_cffi غير متاح لتحميل هذا الرابط"
+        })
+        return
+
+    final_path = DOWNLOADS_DIR / f"{job_id}.mp4"
+    try:
+        await send_progress(job_id, {
+            "type": "info",
+            "title": "video",
+            "thumbnail": "",
+            "duration": 0,
+            "uploader": "",
+        })
+        await send_progress(job_id, {
+            "type": "processing",
+            "message": "جاري تحميل ملف MP4 المباشر..."
+        })
+
+        def do_download():
+            headers = {
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": referer,
+                "Range": "bytes=0-",
+            }
+            with cffi_requests.get(
+                mp4_url,
+                impersonate="chrome120",
+                headers=headers,
+                timeout=60,
+                stream=True,
+                allow_redirects=True,
+            ) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0)) or 0
+                downloaded = 0
+                last_update = 0
+                start_time = time.time()
+                with open(final_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            now = time.time()
+                            if now - last_update > 0.3:
+                                last_update = now
+                                pct = (downloaded / total * 100) if total else 0
+                                speed = downloaded / (now - start_time) if now > start_time else 0
+                                payload = {
+                                    "type": "progress",
+                                    "percentage": round(pct, 2),
+                                    "speed": speed,
+                                    "speed_text": format_bytes(speed) + "/s" if speed else "—",
+                                    "eta": (total - downloaded) / speed if speed else 0,
+                                    "downloaded": downloaded,
+                                    "downloaded_text": format_bytes(downloaded),
+                                    "total": total,
+                                    "total_text": format_bytes(total) if total else "—",
+                                }
+                                asyncio.run_coroutine_threadsafe(
+                                    send_progress(job_id, payload), main_loop
+                                )
+
+        await asyncio.to_thread(do_download)
 
         file_size = final_path.stat().st_size
-        filename = f"{title}.mp4"
-
         download_jobs[job_id].update({
             "file_path": str(final_path),
-            "filename": filename,
+            "filename": "video.mp4",
             "file_size": file_size,
             "completed": True,
             "completed_at": time.time(),
@@ -265,14 +463,14 @@ async def download_video_task(job_id: str, url: str):
         await send_progress(job_id, {
             "type": "complete",
             "download_url": f"/download/{job_id}",
-            "filename": filename,
+            "filename": "video.mp4",
             "size_text": format_bytes(file_size),
         })
 
     except Exception as e:
         await send_progress(job_id, {
             "type": "error",
-            "message": f"خطأ أثناء التحميل: {str(e)}"
+            "message": f"خطأ في التحميل المباشر: {str(e)}"
         })
 
 
@@ -388,4 +586,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="info",
-                    )
+            )
