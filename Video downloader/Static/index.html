@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+    <meta name="theme-color" content="#0a0a0f">
+    <meta name="description" content="Download videos from any website as high-quality MP4 files.">
+    <title>Video Downloader</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        base: {
+                            950: '#07070b',
+                            900: '#0a0a0f',
+                            800: '#12121a',
+                            700: '#1a1a26',
+                            600: '#242433',
+                        },
+                        accent: {
+                            500: '#8b5cf6',
+                            400: '#a78bfa',
+                            300: '#c4b5fd',
+                        },
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+
+    <!-- Fonts: Inter (English, variable weight) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- GSAP -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+
+    <style>
+        * {
+            -webkit-tap-highlight-color: transparent;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        html, body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background: #07070b;
+            color: #e7e7ee;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Animated background blobs */
+        .bg-gradient {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            background:
+                radial-gradient(ellipse 80% 60% at 50% 0%, rgba(124, 58, 237, 0.18) 0%, transparent 50%),
+                radial-gradient(ellipse 60% 50% at 100% 100%, rgba(236, 72, 153, 0.12) 0%, transparent 50%),
+                radial-gradient(ellipse 60% 50% at 0% 100%, rgba(6, 182, 212, 0.10) 0%, transparent 50%),
+                #07070b;
+            pointer-events: none;
+        }
+        .bg-blob {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(90px);
+            opacity: 0.35;
+            z-index: 0;
+            pointer-events: none;
+            will-change: transform;
+        }
+        .blob-1 {
+            width: 480px; height: 480px;
+            background: #7c3aed;
+            top: -160px; right: -120px;
+            animation: float-a 22s ease-in-out infinite;
+        }
+        .blob-2 {
+            width: 380px; height: 380px;
+            background: #06b6d4;
+            bottom: -120px; left: -120px;
+            animation: float-b 28s ease-in-out infinite;
+        }
+        .blob-3 {
+            width: 320px; height: 320px;
+            background: #ec4899;
+            top: 55%; left: 35%;
+            opacity: 0.22;
+            animation: float-c 34s ease-in-out infinite;
+        }
+        @keyframes float-a {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            50% { transform: translate(-60px, 70px) scale(1.1); }
+        }
+        @keyframes float-b {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            50% { transform: translate(70px, -60px) scale(1.15); }
+        }
+        @keyframes float-c {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            33% { transform: translate(90px, -40px) scale(0.9); }
+            66% { transform: translate(-70px, 50px) scale(1.1); }
+        }
+
+        /* Glass card */
+        .glass {
+            background: rgba(18, 18, 26, 0.65);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow:
+                0 30px 80px -20px rgba(0, 0, 0, 0.6),
+                0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+        }
+
+        /* URL input */
+        .url-input {
+            background: rgba(26, 26, 38, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .url-input::placeholder { color: rgba(231, 231, 238, 0.35); }
+        .url-input:hover {
+            border-color: rgba(255, 255, 255, 0.16);
+            background: rgba(26, 26, 38, 0.75);
+        }
+        .url-input:focus {
+            outline: none;
+            border-color: rgba(139, 92, 246, 0.8);
+            background: rgba(26, 26, 38, 0.8);
+            box-shadow:
+                0 0 0 4px rgba(139, 92, 246, 0.18),
+                0 10px 40px -10px rgba(139, 92, 246, 0.35);
+        }
+
+        /* Download button */
+        .btn-download {
+            background: linear-gradient(135deg, #7c3aed 0%, #ec4899 100%);
+            background-size: 180% 180%;
+            transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+            box-shadow:
+                0 10px 30px -8px rgba(124, 58, 237, 0.5),
+                0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+        }
+        .btn-download:hover:not(:disabled) {
+            background-position: 100% 100%;
+            transform: translateY(-2px);
+            box-shadow:
+                0 18px 40px -10px rgba(124, 58, 237, 0.6),
+                0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+        }
+        .btn-download:active:not(:disabled) {
+            transform: translateY(0);
+            box-shadow:
+                0 6px 18px -6px rgba(124, 58, 237, 0.5),
+                0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+        }
+        .btn-download:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .btn-download::before {
+            content: '';
+            position: absolute;
+            top: 0; left: -120%;
+            width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.25), transparent);
+            transition: left 0.7s ease;
+            pointer-events: none;
+        }
+        .btn-download:hover:not(:disabled)::before { left: 120%; }
+
+        /* Final download (success) button */
+        .btn-success {
+            background: linear-gradient(135deg, #10b981 0%, #06b6d4 100%);
+            background-size: 180% 180%;
+            transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow:
+                0 10px 30px -8px rgba(16, 185, 129, 0.5),
+                0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+        }
+        .btn-success:hover {
+            background-position: 100% 100%;
+            transform: translateY(-2px);
+            box-shadow:
+                0 18px 40px -10px rgba(16, 185, 129, 0.6),
+                0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+        }
+
+        /* Progress bar */
+        .progress-track {
+            background: rgba(36, 36, 51, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+        }
+        .progress-fill {
+            background: linear-gradient(90deg, #8b5cf6 0%, #ec4899 50%, #06b6d4 100%);
+            background-size: 200% 100%;
+            animation: shimmer 2.5s linear infinite;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 0 16px rgba(139, 92, 246, 0.5);
+        }
+        @keyframes shimmer {
+            0%   { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        /* Spinner */
+        .spinner {
+            border: 2px solid rgba(167, 139, 250, 0.2);
+            border-top-color: #a78bfa;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Stat cards */
+        .stat-card {
+            background: rgba(26, 26, 38, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.25s ease;
+        }
+        .stat-card:hover {
+            background: rgba(26, 26, 38, 0.6);
+            border-color: rgba(255, 255, 255, 0.1);
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #07070b; }
+        ::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, #7c3aed, #ec4899);
+            border-radius: 4px;
+            border: 2px solid #07070b;
+        }
+
+        /* Hide progress card initially */
+        #progress-card { display: none; }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            top: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(-20px);
+            z-index: 100;
+            padding: 14px 22px;
+            border-radius: 14px;
+            font-weight: 500;
+            font-size: 14px;
+            backdrop-filter: blur(20px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+            pointer-events: auto;
+        }
+        .toast.error {
+            background: rgba(239, 68, 68, 0.18);
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            color: #fca5a5;
+        }
+        .toast.success {
+            background: rgba(34, 197, 94, 0.18);
+            border: 1px solid rgba(34, 197, 94, 0.5);
+            color: #86efac;
+        }
+
+        /* Logo glow */
+        .logo-glow {
+            filter: drop-shadow(0 0 24px rgba(139, 92, 246, 0.55));
+        }
+
+        /* Mobile tweaks */
+        @media (max-width: 640px) {
+            .bg-blob { filter: blur(70px); opacity: 0.28; }
+        }
+
+        /* Reduced motion */
+        @media (prefers-reduced-motion: reduce) {
+            .bg-blob { animation: none; }
+            .progress-fill { animation: none; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="bg-gradient"></div>
+    <div class="bg-blob blob-1"></div>
+    <div class="bg-blob blob-2"></div>
+    <div class="bg-blob blob-3"></div>
+
+    <div id="toast" class="toast"></div>
+
+    <main class="relative z-10 min-h-screen flex flex-col items-center justify-center px-4 py-10 sm:py-12">
+
+        <!-- Header -->
+        <header id="header" class="text-center mb-8 sm:mb-10">
+            <div class="inline-flex items-center justify-center w-20 h-20 sm:w-24 sm:h-24 rounded-3xl mb-5 logo-glow"
+                 style="background: linear-gradient(135deg, #7c3aed 0%, #ec4899 100%); box-shadow: 0 0 40px rgba(124, 58, 237, 0.5);">
+                <svg class="w-10 h-10 sm:w-12 sm:h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3"/>
+                </svg>
+            </div>
+            <h1 class="text-3xl sm:text-4xl md:text-5xl font-extrabold mb-3 tracking-tight bg-clip-text text-transparent"
+                style="background-image: linear-gradient(135deg, #c4b5fd 0%, #f9a8d4 50%, #67e8f9 100%);">
+                Video Downloader
+            </h1>
+            <p class="text-gray-400 text-sm sm:text-base max-w-md mx-auto leading-relaxed">
+                Paste any video link and get a high-quality MP4 file in seconds.
+            </p>
+        </header>
+
+        <!-- Main card -->
+        <section id="main-card" class="glass w-full max-w-xl rounded-3xl p-6 sm:p-8">
+
+            <!-- URL input form -->
+            <form id="download-form" class="space-y-4">
+                <div>
+                    <label for="url-input" class="block text-xs font-semibold text-gray-300 mb-2 uppercase tracking-wider">
+                        Video URL
+                    </label>
+                    <div class="relative">
+                        <input
+                            type="url"
+                            id="url-input"
+                            required
+                            dir="ltr"
+                            autocomplete="off"
+                            spellcheck="false"
+                            placeholder="https://www.youtube.com/watch?v=..."
+                            class="url-input w-full rounded-2xl pl-12 pr-4 py-4 sm:py-5 text-white text-sm sm:text-base font-medium"
+                        >
+                        <div class="absolute top-1/2 -translate-y-1/2 left-4 text-gray-500 pointer-events-none">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M10.172 13.828a4 4 0 005.656 0l4-4a4 4 0 10-5.656-5.656l-1.1 1.1"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <button
+                    type="submit"
+                    id="download-btn"
+                    class="btn-download w-full py-4 sm:py-5 rounded-2xl font-bold text-white text-base sm:text-lg flex items-center justify-center gap-3"
+                >
+                    <svg class="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3"/>
+                    </svg>
+                    <span>Download Video</span>
+                </button>
+            </form>
+
+            <!-- Progress card (hidden initially) -->
+            <div id="progress-card" class="mt-6 pt-6 border-t border-white/10 space-y-4">
+
+                <!-- Video info -->
+                <div id="video-info" class="flex items-center gap-3" style="opacity:0">
+                    <img id="video-thumbnail" src="" alt="" class="w-16 h-16 rounded-xl object-cover bg-base-700 hidden flex-shrink-0">
+                    <div class="flex-1 min-w-0">
+                        <h3 id="video-title" class="font-bold text-white text-sm sm:text-base truncate"></h3>
+                        <p id="video-meta" class="text-xs text-gray-400 mt-0.5"></p>
+                    </div>
+                </div>
+
+                <!-- Status row -->
+                <div class="flex items-center justify-between text-sm">
+                    <div class="flex items-center gap-2">
+                        <div id="status-spinner" class="spinner w-4 h-4"></div>
+                        <span id="status-text" class="text-gray-300 font-medium">Preparing...</span>
+                    </div>
+                    <span id="percentage-text" class="font-bold text-accent-300 text-lg tabular-nums">0%</span>
+                </div>
+
+                <!-- Progress bar -->
+                <div class="w-full h-3 rounded-full overflow-hidden progress-track">
+                    <div id="progress-bar" class="progress-fill h-full rounded-full" style="width: 0%"></div>
+                </div>
+
+                <!-- Stats grid -->
+                <div class="grid grid-cols-3 gap-2 text-center text-xs">
+                    <div class="stat-card rounded-xl p-2.5">
+                        <div class="text-gray-500 mb-0.5 uppercase tracking-wide">Speed</div>
+                        <div id="speed-text" class="font-semibold text-cyan-300 tabular-nums">—</div>
+                    </div>
+                    <div class="stat-card rounded-xl p-2.5">
+                        <div class="text-gray-500 mb-0.5 uppercase tracking-wide">Done</div>
+                        <div id="downloaded-text" class="font-semibold text-purple-300 tabular-nums">—</div>
+                    </div>
+                    <div class="stat-card rounded-xl p-2.5">
+                        <div class="text-gray-500 mb-0.5 uppercase tracking-wide">Total</div>
+                        <div id="total-text" class="font-semibold text-pink-300 tabular-nums">—</div>
+                    </div>
+                </div>
+
+                <!-- Final download button -->
+                <a id="final-download-btn" href="#" download
+                   class="btn-success hidden w-full py-3.5 rounded-2xl font-bold text-center text-white flex items-center justify-center gap-2"
+                   style="opacity:0;">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                    </svg>
+                    <span id="final-btn-text">Save File</span>
+                </a>
+            </div>
+
+        </section>
+
+        <!-- Footer -->
+        <footer id="footer" class="mt-8 text-center text-xs text-gray-600 max-w-md leading-relaxed">
+            <p>Files are kept temporarily for 2 hours, then deleted automatically.</p>
+            <p class="mt-1">Supports YouTube, TikTok, Instagram, Twitter, Facebook and 1000+ more sites.</p>
+        </footer>
+
+    </main>
+
+    <script src="/static/script.js"></script>
+</body>
+  </html>
